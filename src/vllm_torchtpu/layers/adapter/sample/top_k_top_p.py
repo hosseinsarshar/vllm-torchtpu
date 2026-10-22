@@ -37,6 +37,10 @@ _MAX_PREFILTER_CHUNK = 256
 # float32 sublanes in a TPU (8, 128) tile. Chunk sizes that are multiples of
 # it fill whole tiles, so the prefilter tries them first.
 _PREFILTER_CHUNK_ALIGN = 8
+# From this many rows, `prefiltered_top_k` reads contiguous chunks when the
+# chunk size is a multiple of _CONTIGUOUS_PREFILTER_CHUNK_MULTIPLE.
+_CONTIGUOUS_PREFILTER_MIN_ROWS = 128
+_CONTIGUOUS_PREFILTER_CHUNK_MULTIPLE = 64
 
 
 def _int32_bsearch(
@@ -358,10 +362,18 @@ def prefiltered_top_k(
 
     Splits each row into chunks, keeps the k chunks with the largest maxima
     (they hold every top-k value) and runs the final top-k only over their
-    k * chunk values. Chunk c holds values c, c + num_chunks,
-    c + 2 * num_chunks, ..., so the chunk maxima are an elementwise max over
-    the rows of a [chunk, num_chunks] view. Values come back sorted in
-    descending order, like `torch.topk`; indices of tied values may differ.
+    k * chunk values. Values come back sorted in descending order, like
+    `torch.topk`; indices of tied values may differ.
+
+    Both chunk layouts give the same values. Chunk c usually holds values
+    c, c + num_chunks, c + 2 * num_chunks, ..., so the chunk maxima are an
+    elementwise max over the rows of a [chunk, num_chunks] view. With at
+    least _CONTIGUOUS_PREFILTER_MIN_ROWS rows and a chunk size that is a
+    multiple of _CONTIGUOUS_PREFILTER_CHUNK_MULTIPLE, chunk c holds the
+    contiguous values c * chunk to (c + 1) * chunk - 1 instead: gathering
+    whole chunks is cheaper at that batch size (for a 151,936 vocab at 128
+    and 256 rows, about 2x faster than strided chunks on TPU v7x and 1.3x on
+    v6e; below 128 rows strided chunks are as fast or faster).
 
     Args:
       values: [batch, num_values].
@@ -378,6 +390,21 @@ def prefiltered_top_k(
     if chunk == 0:
         return torch.topk(values, k, dim=-1, sorted=True)
     num_chunks = num_values // chunk
+    if (
+        batch >= _CONTIGUOUS_PREFILTER_MIN_ROWS
+        and chunk % _CONTIGUOUS_PREFILTER_CHUNK_MULTIPLE == 0
+    ):
+        # chunks[b, c, r] = values[b, c * chunk + r]
+        chunks = values.reshape(batch, num_chunks, chunk)
+        chunk_ids = torch.topk(chunks.amax(dim=-1), k, dim=-1, sorted=False).indices
+        candidates = torch.gather(
+            chunks, 1, chunk_ids.unsqueeze(-1).expand(-1, -1, chunk)
+        ).reshape(batch, k * chunk)
+        top_values, positions = torch.topk(candidates, k, dim=-1, sorted=True)
+        top_indices = (
+            torch.gather(chunk_ids, 1, positions // chunk) * chunk + positions % chunk
+        )
+        return top_values, top_indices
     # chunks[b, r, c] = values[b, r * num_chunks + c]
     chunks = values.reshape(batch, chunk, num_chunks)
     chunk_ids = torch.topk(chunks.amax(dim=1), k, dim=-1, sorted=False).indices

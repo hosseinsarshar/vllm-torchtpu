@@ -232,12 +232,49 @@ def test_prefiltered_top_k_with_ties_and_masked_logits(num_allowed):
         assert row.unique().numel() == row.numel()
 
 
+@pytest.mark.parametrize("ties", [False, True])
+def test_prefiltered_top_k_contiguous_chunks_match_torch_topk(ties):
+    # 128 rows with 64-value chunks take the contiguous-chunk layout.
+    rows, num_values = 128, 151936
+    assert rows >= sampling._CONTIGUOUS_PREFILTER_MIN_ROWS
+    assert sampling.topk_prefilter_chunk(num_values, 64) == 64
+    gen = torch.Generator().manual_seed(11)
+    if ties:
+        values = torch.randint(0, 8, (rows, num_values), generator=gen).float()
+    else:
+        # Each row a permutation of 0..num_values-1: no ties.
+        values = torch.argsort(torch.rand(rows, num_values, generator=gen), dim=-1)
+        values = values.float()
+    expected_values, expected_indices = torch.topk(values, 64)
+    top_values, top_indices = sampling.prefiltered_top_k(values, 64)
+    torch.testing.assert_close(top_values, expected_values, rtol=0, atol=0)
+    if not ties:
+        torch.testing.assert_close(top_indices, expected_indices, rtol=0, atol=0)
+    torch.testing.assert_close(
+        torch.gather(values, 1, top_indices), top_values, rtol=0, atol=0
+    )
+    for row in top_indices:
+        assert row.unique().numel() == row.numel()
+
+
 @pytest.mark.parametrize("vocab_size", [151936, 202048])
 def test_prefilter_matches_full_vocab_for_top_k_sampling(vocab_size):
     gen = torch.Generator().manual_seed(0)
     logits = (torch.randn(6, vocab_size, generator=gen) * 3).bfloat16().float() / 0.6
     top_k = torch.tensor([[20], [1], [32], [5], [20], [20]], dtype=torch.int32)
     top_p = torch.tensor([[0.95], [1.0], [0.9], [0.5], [1.0], [0.8]])
+    expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
+    result = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_prefilter=True)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+
+def test_prefilter_matches_full_vocab_with_contiguous_chunks():
+    # Same check at 128 rows, where prefiltered_top_k reads contiguous chunks.
+    rows, vocab_size = 128, 151936
+    gen = torch.Generator().manual_seed(5)
+    logits = (torch.randn(rows, vocab_size, generator=gen) * 3).bfloat16().float()
+    top_k = torch.randint(1, 33, (rows, 1), generator=gen, dtype=torch.int32)
+    top_p = torch.rand(rows, 1, generator=gen) * 0.5 + 0.5
     expected = sampling.apply_top_k_top_p(logits, top_k, top_p)
     result = sampling.apply_top_k_top_p(logits, top_k, top_p, topk_prefilter=True)
     torch.testing.assert_close(result, expected, rtol=0, atol=0)
