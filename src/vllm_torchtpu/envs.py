@@ -189,6 +189,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    ENABLE_TOPK_PREFILTER: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -1114,6 +1115,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
         "TPU_SAMPLER_TOPK_CANDIDATES", 0
     ),
+    # Non-greedy sampling finds each row's top candidates with an exact
+    # two-stage top-k (strided chunk maxima, then top-k over the best chunks),
+    # applies top-p with one sort, and samples from those candidates instead
+    # of the full vocab. Same flag as tpu-inference. Used only when every
+    # active request has 1 <= top_k <= 32 and no grammar mask applies; takes
+    # precedence over TPU_SAMPLER_TOPK_CANDIDATES. Off by default.
+    "ENABLE_TOPK_PREFILTER": env_bool("ENABLE_TOPK_PREFILTER"),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).

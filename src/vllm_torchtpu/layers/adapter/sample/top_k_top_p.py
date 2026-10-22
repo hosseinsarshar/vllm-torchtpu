@@ -28,6 +28,15 @@ MASKED_LOGIT_VALUE = -1e12
 # and gathers run without tail padding. At 64 blocks, candidate bisection
 # evaluates 8,192 logits instead of 248,320.
 CANDIDATE_BLOCK = 128
+# Candidates per row that the top-k prefilter (ENABLE_TOPK_PREFILTER) keeps.
+# Exact for 1 <= top_k <= TOPK_PREFILTER_CANDIDATES // 2: the spare half keeps
+# logits that tie with the k-th largest, which the full-vocab bisection keeps.
+TOPK_PREFILTER_CANDIDATES = 64
+# Largest chunk size the top-k prefilter tries.
+_MAX_PREFILTER_CHUNK = 256
+# float32 sublanes in a TPU (8, 128) tile. Chunk sizes that are multiples of
+# it fill whole tiles, so the prefilter tries them first.
+_PREFILTER_CHUNK_ALIGN = 8
 
 
 def _int32_bsearch(
@@ -250,7 +259,10 @@ def apply_top_k_top_p(
     top_k: torch.Tensor,
     top_p: torch.Tensor,
     topk_candidates: int = 0,
+    topk_prefilter: bool = False,
 ) -> torch.Tensor:
+    if topk_prefilter:
+        return apply_top_k_top_p_prefilter(logits, top_k, top_p)
     if topk_candidates > 0:
         return apply_top_k_top_p_candidates(logits, top_k, top_p, topk_candidates)
     should_apply_topk = (top_k > 0).expand(-1, logits.shape[-1])
@@ -311,3 +323,181 @@ def apply_top_k_top_p_candidates(
         logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
     )
     return torch.where(top_k > 0, masked, logits)
+
+
+def topk_prefilter_chunk(num_values: int, k: int) -> int:
+    """Returns the chunk size that sorts the fewest values, or 0 to skip.
+
+    `prefiltered_top_k` sorts num_values // chunk chunk maxima and then
+    k * chunk candidates. Chunk sizes that are multiples of 8 fill whole
+    float32 TPU tiles, so they are tried first. If none divides num_values,
+    any divisor up to _MAX_PREFILTER_CHUNK is used (e.g. 56 for 202,048, or
+    14 for 12,628). 0 means no chunk size sorts fewer values than a plain
+    top-k over the whole row.
+    """
+    aligned = range(
+        _PREFILTER_CHUNK_ALIGN, _MAX_PREFILTER_CHUNK + 1, _PREFILTER_CHUNK_ALIGN
+    )
+    for chunk_sizes in (aligned, range(2, _MAX_PREFILTER_CHUNK + 1)):
+        best_chunk, best_cost = 0, num_values
+        for chunk in chunk_sizes:
+            if num_values % chunk or num_values // chunk < k:
+                continue
+            cost = num_values // chunk + k * chunk
+            if cost < best_cost:
+                best_chunk, best_cost = chunk, cost
+        if best_chunk:
+            return best_chunk
+    return 0
+
+
+def prefiltered_top_k(
+    values: torch.Tensor, k: int, chunk: int | None = None
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Same values as `torch.topk(values, k)`, from a fraction of the row.
+
+    Splits each row into chunks, keeps the k chunks with the largest maxima
+    (they hold every top-k value) and runs the final top-k only over their
+    k * chunk values. Chunk c holds values c, c + num_chunks,
+    c + 2 * num_chunks, ..., so the chunk maxima are an elementwise max over
+    the rows of a [chunk, num_chunks] view. Values come back sorted in
+    descending order, like `torch.topk`; indices of tied values may differ.
+
+    Args:
+      values: [batch, num_values].
+      k: Values to return per row. At most num_values.
+      chunk: Chunk size. None picks it with `topk_prefilter_chunk`; 0 runs a
+        plain `torch.topk`.
+
+    Returns:
+      (top_values, top_indices), each [batch, k].
+    """
+    batch, num_values = values.shape
+    if chunk is None:
+        chunk = topk_prefilter_chunk(num_values, k)
+    if chunk == 0:
+        return torch.topk(values, k, dim=-1, sorted=True)
+    num_chunks = num_values // chunk
+    # chunks[b, r, c] = values[b, r * num_chunks + c]
+    chunks = values.reshape(batch, chunk, num_chunks)
+    chunk_ids = torch.topk(chunks.amax(dim=1), k, dim=-1, sorted=False).indices
+    candidates = torch.gather(
+        chunks, 2, chunk_ids.unsqueeze(1).expand(-1, chunk, -1)
+    ).reshape(batch, chunk * k)
+    top_values, positions = torch.topk(candidates, k, dim=-1, sorted=True)
+    top_indices = (positions // k) * num_chunks + torch.gather(
+        chunk_ids, 1, positions % k
+    )
+    return top_values, top_indices
+
+
+def _sorted_top_k_top_p_cutoff(
+    top_values: torch.Tensor, top_k: torch.Tensor, top_p: torch.Tensor
+) -> torch.Tensor:
+    """Per-row logit cutoff of top-k then top-p, from sorted candidates.
+
+    Keeping the values >= the cutoff matches `topk_mask` followed by
+    `topp_mask` on the full row, ties included, as long as the candidates
+    hold every logit >= the k-th largest. Top-p runs one softmax and one
+    cumulative sum over the candidates instead of a 31-step bisection.
+
+    Args:
+      top_values: Each row's largest logits in descending order.
+        [batch, num_candidates]
+      top_k: [batch, 1]. Values outside [1, num_candidates] are clamped.
+      top_p: [batch, 1].
+
+    Returns:
+      [batch, 1] float32 cutoff.
+    """
+    # The candidates are few, so run the top-p sums in float32 even for
+    # bfloat16 logits.
+    top_values = top_values.to(torch.float32)
+    num_candidates = top_values.shape[-1]
+    k_index = (top_k - 1).clamp(min=0, max=num_candidates - 1).to(torch.int64)
+    k_cutoff = torch.gather(top_values, -1, k_index)
+    in_top_k = top_values >= k_cutoff
+    topk_values = torch.where(
+        in_top_k, top_values, torch.full_like(top_values, MASKED_LOGIT_VALUE)
+    )
+    cumulative = torch.cumsum(torch.softmax(topk_values, dim=-1), dim=-1)
+    num_in_top_k = in_top_k.to(torch.int32).sum(dim=-1, keepdim=True)
+    # The first position whose cumulative mass reaches top_p closes the
+    # top-p set; float rounding can leave the total just below 1.0.
+    p_index = torch.minimum(
+        (cumulative < top_p).to(torch.int32).sum(dim=-1, keepdim=True),
+        num_in_top_k - 1,
+    ).to(torch.int64)
+    p_cutoff = torch.gather(top_values, -1, p_index)
+    return torch.where(top_p < 1.0, p_cutoff, k_cutoff)
+
+
+def apply_top_k_top_p_prefilter(
+    logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+) -> torch.Tensor:
+    """Applies top-k then top-p using the row's top-k prefilter candidates.
+
+    Finds each row's cutoff from its TOPK_PREFILTER_CANDIDATES largest
+    logits (`prefiltered_top_k`) and masks the full row below it. Matches
+    `apply_top_k_top_p` unless more than TOPK_PREFILTER_CANDIDATES - k + 1
+    logits tie at the k-th largest value; float32 sums run in a different
+    order, so a top-p boundary within rounding can flip. Caller must ensure
+    active rows have 1 <= top_k <= TOPK_PREFILTER_CANDIDATES // 2; rows with
+    top_k <= 0 (padded slots) are returned unmasked.
+
+    Args:
+      logits: [batch, vocab_size].
+      top_k: [batch, 1] integer.
+      top_p: [batch, 1] float.
+
+    Returns:
+      Masked logits. [batch, vocab_size]
+    """
+    top_values, _ = prefiltered_top_k(logits, TOPK_PREFILTER_CANDIDATES)
+    cutoff = _sorted_top_k_top_p_cutoff(top_values, top_k, top_p)
+    masked = torch.where(
+        logits >= cutoff, logits, torch.full_like(logits, MASKED_LOGIT_VALUE)
+    )
+    return torch.where(top_k > 0, masked, logits)
+
+
+def sample_top_k_top_p_prefilter(
+    scaled_logits: torch.Tensor,
+    top_k: torch.Tensor,
+    top_p: torch.Tensor,
+    u: torch.Tensor,
+) -> torch.Tensor:
+    """Samples one token per row from its top-k / top-p candidates.
+
+    Draws from the same distribution as `apply_top_k_top_p` plus a Gumbel-max
+    over the full vocab, but only the TOPK_PREFILTER_CANDIDATES largest
+    logits of each row are masked and perturbed. With u[:, i] equal to the
+    full-vocab noise at the i-th candidate's token, it returns the same token.
+    Same caller contract as `apply_top_k_top_p_prefilter`.
+
+    Args:
+      scaled_logits: Temperature-scaled logits. [batch, vocab_size]
+      top_k: [batch, 1] integer.
+      top_p: [batch, 1] float.
+      u: Uniform noise for the candidates. [batch, TOPK_PREFILTER_CANDIDATES]
+
+    Returns:
+      Sampled token ids. [batch, 1]
+    """
+    top_values, top_indices = prefiltered_top_k(
+        scaled_logits, TOPK_PREFILTER_CANDIDATES
+    )
+    cutoff = _sorted_top_k_top_p_cutoff(top_values, top_k, top_p)
+    kept_values = torch.where(
+        top_values >= cutoff,
+        top_values,
+        torch.full_like(top_values, MASKED_LOGIT_VALUE),
+    )
+    u_clamped = torch.clamp(
+        u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
+    )
+    noisy_values = kept_values - torch.log(-torch.log(u_clamped))
+    position = torch.argmax(noisy_values, dim=-1, keepdim=True)
+    return torch.gather(top_indices, -1, position)
