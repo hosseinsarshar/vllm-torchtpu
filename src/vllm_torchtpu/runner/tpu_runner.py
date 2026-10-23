@@ -49,7 +49,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
-from vllm.distributed import get_pcp_group
+from vllm.distributed import get_pcp_group, get_tp_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -124,7 +124,9 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import validate_online
 from vllm_torchtpu.layers.adapter.sample.rejection_sampler import RejectionSampler
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     CANDIDATE_BLOCK,
+    TOPK_PREFILTER_CANDIDATES,
     apply_top_k_top_p,
+    sample_top_k_top_p_prefilter,
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -338,6 +340,22 @@ def _spec_logprob_row_tokens(
     out = torch.zeros(num_rows + 1, dtype=torch.int64, device=next_tokens.device)
     out = out.scatter(0, rows.flatten(), tokens.flatten())
     return out[:num_rows, None]
+
+
+def _sampling_uniforms(
+    logits: torch.Tensor,
+    generator: torch.Generator | None,
+    topk_prefilter: bool = False,
+) -> torch.Tensor:
+    """Float32 uniform noise per logit, or per top-k prefilter candidate."""
+    if topk_prefilter:
+        return torch.rand(
+            (logits.shape[0], TOPK_PREFILTER_CANDIDATES),
+            dtype=torch.float32,
+            device=logits.device,
+            generator=generator,
+        )
+    return torch.rand_like(logits, dtype=torch.float32, generator=generator)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -1037,6 +1055,7 @@ class TPUModelRunner(GPUModelRunner):
         # Dedicated RNG for non-greedy sampling, to keep the draws consistent
         # across a replica's TP ranks (else they diverge -> collective hang).
         self._sampling_generator: torch.Generator | None = None
+        self._check_topk_prefilter_matches_across_tp()
         # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
@@ -4487,6 +4506,7 @@ class TPUModelRunner(GPUModelRunner):
             )
         req_temperatures = req_top_k = req_top_p = None
         topk_candidates = 0
+        topk_prefilter = False
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
                 logits, md.bonus_logits_indices, md.target_logits_indices
@@ -4516,11 +4536,15 @@ class TPUModelRunner(GPUModelRunner):
                         cur_start_idx, cur_end_idx, bonus_logits
                     )
                 )
-                topk_candidates = self._sampler_topk_candidates(
+                topk_prefilter = self._sampler_topk_prefilter(
                     cur_start_idx, cur_end_idx, grammar_output
                 )
-                bonus_u = torch.rand_like(
-                    bonus_logits, dtype=torch.float32, generator=sampling_generator
+                if not topk_prefilter:
+                    topk_candidates = self._sampler_topk_candidates(
+                        cur_start_idx, cur_end_idx, grammar_output
+                    )
+                bonus_u = _sampling_uniforms(
+                    bonus_logits, sampling_generator, topk_prefilter
                 )
                 bonus_token_ids = self.sample_from_logits_func(
                     bonus_logits,
@@ -4531,6 +4555,7 @@ class TPUModelRunner(GPUModelRunner):
                     all_greedy=False,
                     topk_candidates=topk_candidates,
                     apply_topk_topp=self._sampler_applies_topk_topp(),
+                    topk_prefilter=topk_prefilter,
                 ).view(-1)
         accept_u = None
         assert self.rejection_sampler is not None
@@ -4576,6 +4601,7 @@ class TPUModelRunner(GPUModelRunner):
             do_sampling=True,
             topk_candidates=topk_candidates,
             apply_topk_topp=self._sampler_applies_topk_topp(),
+            topk_prefilter=topk_prefilter,
         )
 
     @_pp_step
@@ -4713,10 +4739,11 @@ class TPUModelRunner(GPUModelRunner):
                                     cur_start_idx, cur_end_idx, logits
                                 )
                             )
-                            u = torch.rand_like(
-                                logits,
-                                dtype=torch.float32,
-                                generator=sampling_generator,
+                            topk_prefilter = self._sampler_topk_prefilter(
+                                cur_start_idx, cur_end_idx, grammar_output
+                            )
+                            u = _sampling_uniforms(
+                                logits, sampling_generator, topk_prefilter
                             )
                             selected = self.sample_from_logits_func(
                                 logits,
@@ -4725,10 +4752,15 @@ class TPUModelRunner(GPUModelRunner):
                                 top_k_tpu,
                                 top_p_tpu,
                                 all_greedy=False,
-                                topk_candidates=self._sampler_topk_candidates(
-                                    cur_start_idx, cur_end_idx, grammar_output
+                                topk_candidates=(
+                                    0
+                                    if topk_prefilter
+                                    else self._sampler_topk_candidates(
+                                        cur_start_idx, cur_end_idx, grammar_output
+                                    )
                                 ),
                                 apply_topk_topp=self._sampler_applies_topk_topp(),
+                                topk_prefilter=topk_prefilter,
                             )
                     assert self.speculative_config is not None
                     padded = torch.full(
@@ -4784,8 +4816,11 @@ class TPUModelRunner(GPUModelRunner):
                                 cur_start_idx, cur_end_idx, logits
                             )
                         )
-                        u = torch.rand_like(
-                            logits, dtype=torch.float32, generator=sampling_generator
+                        topk_prefilter = self._sampler_topk_prefilter(
+                            cur_start_idx, cur_end_idx, grammar_output
+                        )
+                        u = _sampling_uniforms(
+                            logits, sampling_generator, topk_prefilter
                         )
                         selected_token_ids = self.sample_from_logits_func(
                             logits,
@@ -4794,10 +4829,15 @@ class TPUModelRunner(GPUModelRunner):
                             top_k_tpu,
                             top_p_tpu,
                             all_greedy=all_greedy,
-                            topk_candidates=self._sampler_topk_candidates(
-                                cur_start_idx, cur_end_idx, grammar_output
+                            topk_candidates=(
+                                0
+                                if topk_prefilter
+                                else self._sampler_topk_candidates(
+                                    cur_start_idx, cur_end_idx, grammar_output
+                                )
                             ),
                             apply_topk_topp=self._sampler_applies_topk_topp(),
+                            topk_prefilter=topk_prefilter,
                         )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
@@ -6124,6 +6164,17 @@ class TPUModelRunner(GPUModelRunner):
                         apply_topk_topp=apply_topk_topp,
                     )
                     synchronize_tensors(out)
+                if self._topk_prefilter_enabled():
+                    out = self.sample_from_logits_func(
+                        dummy_logits,
+                        dummy_temperatures,
+                        _sampling_uniforms(dummy_logits, None, topk_prefilter=True),
+                        dummy_top_k,
+                        dummy_top_p,
+                        all_greedy=False,
+                        topk_prefilter=True,
+                    )
+                    synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
 
     def _precompile_gather_logprobs(self) -> None:
@@ -6381,6 +6432,24 @@ class TPUModelRunner(GPUModelRunner):
                             recover_u=warm_recover_u,
                             do_sampling=True,
                             topk_candidates=blocks,
+                        )
+                        synchronize_tensors(out)
+                    if self._topk_prefilter_enabled():
+                        out = self.rejection_sampler(
+                            draft_token_ids=draft_token_ids,
+                            num_draft_tokens=draft_lengths,
+                            target_logits=target_logits_ng,
+                            bonus_token_ids=bonus_token_ids,
+                            segment_ids=segment_ids,
+                            group_indices=group_indices,
+                            max_draft_tokens=k,
+                            temperatures=warm_temps,
+                            top_k=warm_top_k,
+                            top_p=warm_top_p,
+                            accept_u=warm_accept_u,
+                            recover_u=warm_recover_u,
+                            do_sampling=True,
+                            topk_prefilter=True,
                         )
                         synchronize_tensors(out)
                     logger.info(
@@ -7844,6 +7913,57 @@ class TPUModelRunner(GPUModelRunner):
         )
         return num_blocks
 
+    def _topk_prefilter_enabled(self) -> bool:
+        """Whether ENABLE_TOPK_PREFILTER is set and the vocab is large enough."""
+        return (
+            envs.ENABLE_TOPK_PREFILTER and self.vocab_size >= TOPK_PREFILTER_CANDIDATES
+        )
+
+    def _check_topk_prefilter_matches_across_tp(self) -> None:
+        """Raises unless every TP rank has the same ENABLE_TOPK_PREFILTER.
+
+        The flag sets the shape of each step's sampling noise, and TP ranks
+        sample the same tokens only while they draw the same shapes.
+        """
+        tp_group = get_tp_group()
+        if tp_group.world_size == 1:
+            return
+        flags: list[object] = [None] * tp_group.world_size
+        torch.distributed.all_gather_object(
+            flags, envs.ENABLE_TOPK_PREFILTER, group=tp_group.cpu_group
+        )
+        if len(set(flags)) > 1:
+            raise RuntimeError(
+                f"ENABLE_TOPK_PREFILTER differs across TP ranks ({flags}); set "
+                "the same value on every host so their sampling stays in sync."
+            )
+
+    def _sampler_topk_prefilter(
+        self,
+        cur_start_idx: int,
+        cur_end_idx: int,
+        grammar_output: object | None,
+    ) -> bool:
+        """Whether this chunk samples from the top-k prefilter candidates.
+
+        Needs no grammar mask and 1 <= top_k <= TOPK_PREFILTER_CANDIDATES // 2
+        on every sampled row. Greedy rows (stored with top_k = vocab_size) take
+        the full-vocab argmax, so they don't block it.
+        """
+        if not self._topk_prefilter_enabled() or grammar_output is not None:
+            return False
+        rows = slice(cur_start_idx, cur_end_idx)
+        top_k = self.input_batch.top_k_cpu_tensor[rows]
+        greedy = self.input_batch.temperature_cpu_tensor[rows] <= SAMPLING_EPS
+        in_range = (top_k >= 1) & (top_k <= TOPK_PREFILTER_CANDIDATES // 2)
+        if not bool((in_range | greedy).all()):
+            return False
+        logger.info_once(
+            "Sampler uses the top-k prefilter with %d candidates per row.",
+            TOPK_PREFILTER_CANDIDATES,
+        )
+        return True
+
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def compute_selected_logits(
         self, hidden_states: torch.Tensor, indices_do_sample: torch.Tensor
@@ -7950,15 +8070,23 @@ class TPUModelRunner(GPUModelRunner):
         all_greedy: bool = False,
         topk_candidates: int = 0,
         apply_topk_topp: bool = True,
+        topk_prefilter: bool = False,
     ) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
         separately from `forward` for lighter compilation overhead.
+
+        With `topk_prefilter`, rows sample from their top-k prefilter
+        candidates and `u` is [rows, TOPK_PREFILTER_CANDIDATES].
         """
         if all_greedy:
             return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
+        if topk_prefilter:
+            sampled = sample_top_k_top_p_prefilter(scaled_logits, top_k, top_p, u)
+            greedy = torch.argmax(logits, dim=-1, keepdim=True)
+            return torch.where(is_greedy, greedy, sampled)
         if apply_topk_topp:
             masked_logits = apply_top_k_top_p(
                 scaled_logits, top_k, top_p, topk_candidates

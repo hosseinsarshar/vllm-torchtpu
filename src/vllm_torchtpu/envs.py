@@ -189,6 +189,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    ENABLE_TOPK_PREFILTER: bool = False
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -1114,6 +1115,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
         "TPU_SAMPLER_TOPK_CANDIDATES", 0
     ),
+    # Sample from each row's top 64 logits, found with an exact two-stage top-k,
+    # and apply top-p with one sort. Same flag as tpu-inference. Off by default.
+    # A step uses it when no grammar mask applies and every sampled request has
+    # 1 <= top_k <= 32 (greedy requests are fine); it then replaces
+    # TPU_SAMPLER_TOPK_CANDIDATES. Token odds stay the same, but:
+    # - It draws 64 random numbers per row, not one per vocab entry, so a seed
+    #   gives other tokens than with the flag off. Set it the same on every
+    #   host (TP ranks check this at startup).
+    # - Whether a step uses it depends on the whole batch, so a request's token
+    #   can depend on its batch-mates.
+    # - At 128+ rows the chunk layout can change, and with it which of several
+    #   exactly tied tokens is picked.
+    # - If more than 65 - top_k logits tie at the k-th largest value, it samples
+    #   from only 64 of them.
+    "ENABLE_TOPK_PREFILTER": env_bool("ENABLE_TOPK_PREFILTER"),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).

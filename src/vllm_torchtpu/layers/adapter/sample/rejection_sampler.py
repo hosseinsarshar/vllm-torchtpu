@@ -69,6 +69,7 @@ class RejectionSampler:
         topk_candidates: int = 0,
         target_argmax: torch.Tensor | None = None,
         apply_topk_topp: bool = True,
+        topk_prefilter: bool = False,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -87,6 +88,7 @@ class RejectionSampler:
             topk_candidates=topk_candidates,
             target_argmax=target_argmax,
             apply_topk_topp=apply_topk_topp,
+            topk_prefilter=topk_prefilter,
         )
 
     def forward(
@@ -107,6 +109,7 @@ class RejectionSampler:
         topk_candidates: int = 0,
         target_argmax: torch.Tensor | None = None,
         apply_topk_topp: bool = True,
+        topk_prefilter: bool = False,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -136,6 +139,7 @@ class RejectionSampler:
             path. The caller passes False only when no request sets top-k or
             top-p, where the two 31-step bisections over the vocabulary are
             the identity (7.5 ms per 512 rows on Flash). A separate graph.
+          topk_prefilter: Apply top-k / top-p with `apply_top_k_top_p_prefilter`.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -175,6 +179,7 @@ class RejectionSampler:
                 self.synthetic_mode,
                 topk_candidates,
                 apply_topk_topp,
+                topk_prefilter,
             )
         if self.synthetic_mode and accept_u is None:
             raise ValueError("Synthetic rejection sampling requires accept_u.")
@@ -446,6 +451,7 @@ def _random_rejection_sample_with_segment(
     synthetic_mode: bool,
     topk_candidates: int = 0,
     apply_topk_topp: bool = True,
+    topk_prefilter: bool = False,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -465,7 +471,9 @@ def _random_rejection_sample_with_segment(
         temperatures.to(torch.float32) + TEMPERATURE_EPS
     )
     if apply_topk_topp:
-        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, topk_candidates)
+        masked_logits = apply_top_k_top_p(
+            scaled_logits, top_k, top_p, topk_candidates, topk_prefilter
+        )
     else:
         masked_logits = scaled_logits
     target_probs = torch.softmax(masked_logits, dim=-1)

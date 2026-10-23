@@ -3067,6 +3067,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         all_greedy=False,
         topk_candidates=0,
         apply_topk_topp=True,
+        topk_prefilter=False,
     ):
         seen_u_dtypes.append(u.dtype)
         return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
@@ -3087,6 +3088,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             device=torch.device("cpu"),
             _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
             _topk_candidate_blocks=lambda: 0,
+            _topk_prefilter_enabled=lambda: False,
             _precompile_timed=lambda _name: contextlib.nullcontext(),
             sample_from_logits_func=fake_sample_from_logits,
             speculative_config=speculative_config,
@@ -3109,6 +3111,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         ),
         _build_padded_sampling_params=lambda start, end, logits: sampling_params,
         _sampler_topk_candidates=lambda start, end, grammar: 0,
+        _sampler_topk_prefilter=lambda start, end, grammar: False,
         _sampler_applies_topk_topp=lambda: True,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
@@ -3191,6 +3194,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _get_sampling_generator=lambda: None,
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,
+            _sampler_topk_prefilter=lambda start, end, grammar: False,
             _sampler_applies_topk_topp=lambda: True,
             sample_from_logits_func=fake_sample_from_logits,
             _update_mamba_slot_read_offsets=lambda *_args: None,
@@ -3204,3 +3208,13 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         TPUModelRunner.sample_tokens(runner, None)
 
     assert seen_u_dtypes == [torch.float32, torch.float32]
+
+
+def test_sampling_uniforms_draw_one_value_per_prefilter_candidate():
+    logits = torch.zeros((3, 151936), dtype=torch.bfloat16)
+    full = tpu_runner._sampling_uniforms(logits, None)
+    assert full.shape == logits.shape
+    assert full.dtype == torch.float32
+    compact = tpu_runner._sampling_uniforms(logits, None, topk_prefilter=True)
+    assert compact.shape == (3, tpu_runner.TOPK_PREFILTER_CANDIDATES)
+    assert compact.dtype == torch.float32
