@@ -139,8 +139,7 @@ class RejectionSampler:
             path. The caller passes False only when no request sets top-k or
             top-p, where the two 31-step bisections over the vocabulary are
             the identity (7.5 ms per 512 rows on Flash). A separate graph.
-          topk_prefilter: Find the top-k / top-p cutoff from the top-k
-            prefilter candidates. See `apply_top_k_top_p_prefilter`.
+          topk_prefilter: Apply top-k / top-p with `apply_top_k_top_p_prefilter`.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the

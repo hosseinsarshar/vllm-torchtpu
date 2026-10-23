@@ -19,6 +19,7 @@ import torch
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter.sample import top_k_top_p as sampling
+from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 
@@ -297,6 +298,23 @@ def test_prefilter_keeps_ties_within_the_documented_bound():
         torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
+def test_prefilter_samples_from_64_tokens_past_the_tie_bound():
+    # 69 logits tie at the top, more than TOPK_PREFILTER_CANDIDATES - k + 1
+    # for k = 20: the full-vocab top-k keeps all 69, the sampler only 64.
+    num_candidates = sampling.TOPK_PREFILTER_CANDIDATES
+    tied = torch.arange(69) * 997 + 7
+    logits = torch.full((num_candidates, 151936), -5.0)
+    logits[:, tied] = 1.0
+    top_k = torch.full((num_candidates, 1), 20, dtype=torch.int32)
+    top_p = torch.ones(num_candidates, 1)
+    # Row r puts all its noise on candidate r, so the rows sample each
+    # candidate once.
+    u = torch.eye(num_candidates)
+    sampled = sampling.sample_top_k_top_p_prefilter(logits, top_k, top_p, u)
+    assert sampled.unique().numel() == num_candidates
+    assert torch.isin(sampled, tied).all()
+
+
 def test_prefilter_leaves_rows_without_top_k_unmasked():
     gen = torch.Generator().manual_seed(1)
     logits = torch.randn(3, 151936, generator=gen)
@@ -335,7 +353,8 @@ def test_sampler_topk_prefilter_gating(monkeypatch):
     runner = TPUModelRunner.__new__(TPUModelRunner)
     runner.vocab_size = 151936
     input_batch = SimpleNamespace(
-        top_k_cpu_tensor=torch.tensor([20, 20, 20, 20], dtype=torch.int64)
+        top_k_cpu_tensor=torch.tensor([20, 20, 20, 20], dtype=torch.int64),
+        temperature_cpu_tensor=torch.full((4,), 0.8),
     )
     runner.input_batch = input_batch
 
@@ -359,6 +378,53 @@ def test_sampler_topk_prefilter_gating(monkeypatch):
     input_batch.top_k_cpu_tensor = torch.tensor([32, 1, 20, 20], dtype=torch.int64)
     runner.vocab_size = 202048
     assert runner._sampler_topk_prefilter(0, 4, None)
+
+
+@pytest.mark.parametrize(
+    "temperature, expected",
+    [
+        ([0.0, 0.8, 0.8, 0.8], True),  # Row 0 is greedy.
+        ([0.8, 0.8, 0.8, 0.8], False),  # Row 0 samples without a top-k.
+    ],
+)
+def test_sampler_topk_prefilter_allows_greedy_rows(monkeypatch, temperature, expected):
+    # vLLM stores top_k = vocab_size both for greedy requests and for requests
+    # without a top-k.
+    vocab_size = 151936
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.vocab_size = vocab_size
+    runner.input_batch = SimpleNamespace(
+        top_k_cpu_tensor=torch.tensor([vocab_size, 20, 20, 20], dtype=torch.int64),
+        temperature_cpu_tensor=torch.tensor(temperature),
+    )
+    monkeypatch.setattr(envs, "ENABLE_TOPK_PREFILTER", True)
+    assert runner._sampler_topk_prefilter(0, 4, None) is expected
+
+
+@pytest.mark.parametrize(
+    "flags, raises",
+    [([True], False), ([True, True], False), ([False, True], True)],
+)
+def test_topk_prefilter_flag_must_match_across_tp_ranks(monkeypatch, flags, raises):
+    gathered = []
+
+    def all_gather_object(out, obj, group=None):
+        gathered.append(obj)
+        out[:] = flags
+
+    monkeypatch.setattr(
+        tpu_runner,
+        "get_tp_group",
+        lambda: SimpleNamespace(world_size=len(flags), cpu_group=None),
+    )
+    monkeypatch.setattr(torch.distributed, "all_gather_object", all_gather_object)
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    if raises:
+        with pytest.raises(RuntimeError, match="ENABLE_TOPK_PREFILTER differs"):
+            runner._check_topk_prefilter_matches_across_tp()
+    else:
+        runner._check_topk_prefilter_matches_across_tp()
+    assert len(gathered) == (len(flags) > 1)
 
 
 def test_rejection_sampler_topk_prefilter_cpu_parity():

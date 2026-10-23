@@ -49,7 +49,7 @@ from vllm.config import (
     get_layers_from_vllm_config,
     set_current_vllm_config,
 )
-from vllm.distributed import get_pcp_group
+from vllm.distributed import get_pcp_group, get_tp_group
 from vllm.distributed.kv_transfer import (
     get_kv_transfer_group,
     has_kv_transfer_group,
@@ -347,11 +347,7 @@ def _sampling_uniforms(
     generator: torch.Generator | None,
     topk_prefilter: bool = False,
 ) -> torch.Tensor:
-    """Float32 uniform noise for sample_from_logits.
-
-    One value per logit, or one per top-k prefilter candidate when the
-    prefilter samples from TOPK_PREFILTER_CANDIDATES logits per row.
-    """
+    """Float32 uniform noise per logit, or per top-k prefilter candidate."""
     if topk_prefilter:
         return torch.rand(
             (logits.shape[0], TOPK_PREFILTER_CANDIDATES),
@@ -1059,6 +1055,7 @@ class TPUModelRunner(GPUModelRunner):
         # Dedicated RNG for non-greedy sampling, to keep the draws consistent
         # across a replica's TP ranks (else they diverge -> collective hang).
         self._sampling_generator: torch.Generator | None = None
+        self._check_topk_prefilter_matches_across_tp()
         # JAX Mesh for shard_map ops in TPU kernels. Real DP is vLLM
         # multi-engine DP, so this per-worker mesh only has a model axis.
         self.mesh = self._create_mesh_for_parallelism()
@@ -7922,23 +7919,44 @@ class TPUModelRunner(GPUModelRunner):
             envs.ENABLE_TOPK_PREFILTER and self.vocab_size >= TOPK_PREFILTER_CANDIDATES
         )
 
+    def _check_topk_prefilter_matches_across_tp(self) -> None:
+        """Raises unless every TP rank has the same ENABLE_TOPK_PREFILTER.
+
+        The flag sets the shape of each step's sampling noise, and TP ranks
+        sample the same tokens only while they draw the same shapes.
+        """
+        tp_group = get_tp_group()
+        if tp_group.world_size == 1:
+            return
+        flags: list[object] = [None] * tp_group.world_size
+        torch.distributed.all_gather_object(
+            flags, envs.ENABLE_TOPK_PREFILTER, group=tp_group.cpu_group
+        )
+        if len(set(flags)) > 1:
+            raise RuntimeError(
+                f"ENABLE_TOPK_PREFILTER differs across TP ranks ({flags}); set "
+                "the same value on every host so their sampling stays in sync."
+            )
+
     def _sampler_topk_prefilter(
         self,
         cur_start_idx: int,
         cur_end_idx: int,
         grammar_output: object | None,
     ) -> bool:
-        """Whether this chunk samples from top-k prefilter candidates.
+        """Whether this chunk samples from the top-k prefilter candidates.
 
-        The candidates match the full-vocab result only when every active
-        request keeps 1 <= top_k <= TOPK_PREFILTER_CANDIDATES // 2 and no
-        grammar mask applies. When it does, the prefilter replaces
-        TPU_SAMPLER_TOPK_CANDIDATES for the chunk.
+        Needs no grammar mask and 1 <= top_k <= TOPK_PREFILTER_CANDIDATES // 2
+        on every sampled row. Greedy rows (stored with top_k = vocab_size) take
+        the full-vocab argmax, so they don't block it.
         """
         if not self._topk_prefilter_enabled() or grammar_output is not None:
             return False
-        top_k = self.input_batch.top_k_cpu_tensor[cur_start_idx:cur_end_idx]
-        if not bool(((top_k >= 1) & (top_k <= TOPK_PREFILTER_CANDIDATES // 2)).all()):
+        rows = slice(cur_start_idx, cur_end_idx)
+        top_k = self.input_batch.top_k_cpu_tensor[rows]
+        greedy = self.input_batch.temperature_cpu_tensor[rows] <= SAMPLING_EPS
+        in_range = (top_k >= 1) & (top_k <= TOPK_PREFILTER_CANDIDATES // 2)
+        if not bool((in_range | greedy).all()):
             return False
         logger.info_once(
             "Sampler uses the top-k prefilter with %d candidates per row.",
@@ -8058,9 +8076,8 @@ class TPUModelRunner(GPUModelRunner):
         Sample with xla-friendly function. This function is to be traced
         separately from `forward` for lighter compilation overhead.
 
-        With `topk_prefilter`, `u` holds TOPK_PREFILTER_CANDIDATES values per
-        row and each row samples from its top-k prefilter candidates
-        (`sample_top_k_top_p_prefilter`) instead of the full vocab.
+        With `topk_prefilter`, rows sample from their top-k prefilter
+        candidates and `u` is [rows, TOPK_PREFILTER_CANDIDATES].
         """
         if all_greedy:
             return torch.argmax(logits, dim=-1, keepdim=True)
